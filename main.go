@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"rate-limiter/limiter"
 	"rate-limiter/middleware"
+	"rate-limiter/shedder"
 	"syscall"
 	"time"
 
@@ -60,11 +62,24 @@ func main() {
 	memLimiter.Cleanup(appCtx)
 	hybridLimiter.StartRecoverySupervisor(appCtx, rdb, 2*time.Second) // Checks Redis every 2s
 
+	// 2. Initialize Load Shedder (Host protection: max 100 concurrent inflight requests)
+	maxConcurrentRequests := 100
+	loadShedder := shedder.NewConcurrencyShedder(maxConcurrentRequests)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond) // Simulating DB/computation
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status": "success", "message": "Request passed through!"}`))
+	})
+
+	// Health & Stats route (Inspect shedder & limiter status live)
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		stats := loadShedder.Stats()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"max_concurrent": %d, "in_flight": %d, "total_shed": %d}`,
+			stats.MaxCapacity, stats.InFlight, stats.TotalShed)
 	})
 
 	// Wrap mux with the RateLimit middleware using client IP as key
@@ -85,14 +100,24 @@ func main() {
 		int(burst),
 	)(mux)
 
+	pipeline := middleware.LoadShed(loadShedder)(hybridLimiterHandler)
+
 	// Configure HTTP Server with production timeouts
 	server := &http.Server{
 		Addr:         ":8080",
-		Handler:      hybridLimiterHandler,
+		Handler:      pipeline,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
+
+	// Testing
+	// Register pprof endpoints directly on mux (bypassing limits if called directly or on an admin port)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 	// Run server in background goroutine & wait for shutdown signal
 	go func() {
